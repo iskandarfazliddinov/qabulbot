@@ -1,0 +1,22 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Database and exports
+*.db
+*.sqlite3
+*.xlsx
+
+# Config and secrets (tokenlarni ochiq joylashtirmaslik uchun)
+config.txt
+.env
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# OS files
+.DS_Store
+Thumbs.db
