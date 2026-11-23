@@ -13,6 +13,7 @@ from datetime import datetime
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter, TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -60,7 +61,8 @@ SHIFTS = {
     "pm": "Tushdan keyin (2-smena)",
 }
 
-WELCOME = (
+def welcome_text() -> str:
+  return (
     "<b>Hurmatli fuqaro!</b>\n\n"
     "O'zbekiston Respublikasi Turizm qo'mitasi tashabbusi bilan Toshkent viloyatining "
     "Bo'stonliq va Parkent tumanlarida mehmonxona va umumiy ovqatlantirish sohasi bo'yicha "
@@ -75,7 +77,17 @@ WELCOME = (
     "3. Ro'yxatdan o'tgan tinglovchi barcha mashg'ulotlarga <b>qatnashishi shart</b>.\n"
     "4. Pasport ma'lumotlari to'g'ri va to'liq kiritilishi lozim.\n\n"
     f"Joriy oqim: <b>{OQIM}</b>.\nRo'yxatdan o'tish uchun «Boshlash» tugmasini bosing."
-)
+  )
+
+def closed_text() -> str:
+    return (
+        "<b>Hurmatli fuqaro!</b>\n\n"
+        f"<b>{OQIM}</b>ga ro'yxatdan o'tish <b>hali boshlanmadi</b>.\n\n"
+        "Ro'yxatdan o'tish ochilishi bilan sizga shu bot orqali xabar yuboramiz — "
+        "botni o'chirmang va bloklamang.\n\n"
+        "Kurslar O'zbekiston Respublikasi Turizm qo'mitasi tashabbusi bilan Xalqaro turizm "
+        "akademiyasi tomonidan Bo'stonliq va Parkent tumanlarida bepul o'tkaziladi."
+    )
 
 def cap(s: str) -> str:
     """Har bir so'zning bosh harfi katta (apostrof buzilmaydi): o'rtaboyev -> O'rtaboyev"""
@@ -102,6 +114,58 @@ def init_db():
             fio TEXT, birth TEXT, passport TEXT, education TEXT,
             phone TEXT, phone2 TEXT, shift TEXT, address TEXT, note TEXT)""")
         con.execute("CREATE INDEX IF NOT EXISTS ix_pass ON reg(passport, oqim)")
+        con.execute("""CREATE TABLE IF NOT EXISTS users (
+            tg_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
+            first_seen TEXT, last_seen TEXT, blocked INTEGER DEFAULT 0)""")
+        # eski yozuvlardagi foydalanuvchilarni ham users jadvaliga qo'shamiz
+        con.execute("""INSERT OR IGNORE INTO users (tg_id, username, first_seen, last_seen)
+                       SELECT tg_id, tg_username, MIN(created_at), MAX(created_at) FROM reg GROUP BY tg_id""")
+
+        con.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+    load_settings()
+
+REG_OPEN = True
+
+def get_setting(key, default=None):
+    with db() as con:
+        r = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return r[0] if r else default
+
+def set_setting(key, value):
+    with db() as con:
+        con.execute("INSERT INTO settings (key,value) VALUES (?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
+
+def load_settings():
+    """Bazadagi sozlamalar (oqim nomi, ro'yxat ochiq/yopiq) config.txt dan ustun turadi."""
+    global OQIM, REG_OPEN
+    OQIM = get_setting("oqim", OQIM)
+    REG_OPEN = get_setting("reg_open", "1") == "1"
+
+def touch_user(user):
+    """Har bir /start bosgan odamni eslab qolamiz — keyin xabar yuborish uchun."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    with db() as con:
+        con.execute("""INSERT INTO users (tg_id, username, first_name, first_seen, last_seen, blocked)
+                       VALUES (?,?,?,?,?,0)
+                       ON CONFLICT(tg_id) DO UPDATE SET username=excluded.username,
+                       first_name=excluded.first_name, last_seen=excluded.last_seen, blocked=0""",
+                    (user.id, user.username, user.first_name, now, now))
+
+def audience(key: str):
+    """key: all | bostonliq | parkent | other  ->  tg_id ro'yxati"""
+    with db() as con:
+        if key == "all":
+            rows = con.execute("SELECT tg_id FROM users WHERE blocked=0").fetchall()
+        else:
+            rows = con.execute("""SELECT DISTINCT r.tg_id FROM reg r
+                                  LEFT JOIN users u ON u.tg_id=r.tg_id
+                                  WHERE r.district=? AND COALESCE(u.blocked,0)=0""", (key,)).fetchall()
+    return [r[0] for r in rows]
+
+def mark_blocked(tg_id: int):
+    with db() as con:
+        con.execute("UPDATE users SET blocked=1 WHERE tg_id=?", (tg_id,))
 
 def save(data: dict, user) -> int:
     with db() as con:
@@ -231,7 +295,11 @@ def summary(d: dict) -> str:
 @router.message(CommandStart())
 async def start(m: Message, state: FSMContext):
     await state.clear()
-    await m.answer(WELCOME, reply_markup=ikb([[("▶️ Boshlash", "go")]]))
+    touch_user(m.from_user)
+    _dirty["since"] = _dirty["since"] or time.time()
+    if not REG_OPEN:
+        return await m.answer(closed_text())
+    await m.answer(welcome_text(), reply_markup=ikb([[("▶️ Boshlash", "go")]]))
     await state.set_state(Reg.welcome)
 
 @router.message(Command("cancel"))
@@ -425,6 +493,155 @@ async def backup_cmd(m: Message, bot: Bot):
         return
     await send_backup(bot, force=True)
     await m.answer("Zaxira nusxa yuborildi va pin qilindi.")
+
+# ---------------------------------------------------------------- xabar tarqatish (/send)
+STARTED_AT = datetime.now()
+AUD_NAMES = {"all": "Hammaga (barcha obunachilar)", "bostonliq": "Faqat Bo'stonliq",
+             "parkent": "Faqat Parkent", "other": "Faqat boshqa tumanlar"}
+
+class Bc(StatesGroup):
+    audience = State()
+    content = State()
+    confirm = State()
+
+@router.message(Command("send"))
+async def send_start(m: Message, state: FSMContext):
+    if not is_admin(m):
+        return
+    await state.clear()
+    rows = [[(f"{v} — {len(audience(k))} kishi", f"aud:{k}")] for k, v in AUD_NAMES.items()]
+    rows.append([("❌ Bekor qilish", "aud:cancel")])
+    await m.answer("<b>Xabar tarqatish.</b> Kimga yuboramiz?", reply_markup=ikb(rows))
+    await state.set_state(Bc.audience)
+
+@router.callback_query(Bc.audience, F.data.startswith("aud:"))
+async def send_pick_audience(c: CallbackQuery, state: FSMContext):
+    key = c.data.split(":")[1]
+    if key == "cancel":
+        await state.clear()
+        await c.message.edit_text("Bekor qilindi.")
+        return await c.answer()
+    await state.update_data(aud=key)
+    await c.message.edit_text(
+        f"Auditoriya: <b>{AUD_NAMES[key]}</b> ({len(audience(key))} kishi)\n\n"
+        f"Endi yuboriladigan xabarni shu yerga yozing yoki yuboring.\n"
+        f"Matn, rasm, hujjat, video — hammasi bo'ladi. Xabar aynan shu ko'rinishda ketadi.\n"
+        f"Bekor qilish: /cancel")
+    await state.set_state(Bc.content)
+    await c.answer()
+
+@router.message(Bc.content, ~F.text.startswith("/"))
+async def send_got_content(m: Message, state: FSMContext):
+    await state.update_data(src_chat=m.chat.id, src_msg=m.message_id)
+    data = await state.get_data()
+    n = len(audience(data["aud"]))
+    await m.answer(f"👆 Yuqoridagi xabar <b>{n} kishiga</b> yuboriladi ({AUD_NAMES[data['aud']]}).\n"
+                   f"Tasdiqlaysizmi?",
+                   reply_markup=ikb([[("✅ Ha, yuborish", "bc:go"), ("❌ Yo'q", "bc:no")]]))
+    await state.set_state(Bc.confirm)
+
+@router.callback_query(Bc.confirm, F.data.startswith("bc:"))
+async def send_confirm(c: CallbackQuery, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    await state.clear()
+    if c.data == "bc:no":
+        await c.message.edit_text("Bekor qilindi.")
+        return await c.answer()
+    ids = audience(data["aud"])
+    await c.message.edit_text(f"⏳ Yuborilmoqda... 0 / {len(ids)}")
+    asyncio.create_task(broadcast(bot, ids, data["src_chat"], data["src_msg"], c.message))
+    await c.answer()
+
+async def broadcast(bot: Bot, ids: list, src_chat: int, src_msg: int, status_msg: Message):
+    ok = blocked = failed = 0
+    for i, uid in enumerate(ids, 1):
+        try:
+            await bot.copy_message(uid, src_chat, src_msg)
+            ok += 1
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+            try:
+                await bot.copy_message(uid, src_chat, src_msg); ok += 1
+            except Exception:
+                failed += 1
+        except TelegramForbiddenError:
+            blocked += 1; mark_blocked(uid)
+        except TelegramBadRequest as e:
+            if "chat not found" in str(e).lower() or "deactivated" in str(e).lower():
+                blocked += 1; mark_blocked(uid)
+            else:
+                failed += 1
+        except Exception as e:
+            logging.warning("broadcast %s: %s", uid, e); failed += 1
+        await asyncio.sleep(0.05)        # Telegram limiti: ~20-30 xabar/sek
+        if i % 50 == 0:
+            try:
+                await status_msg.edit_text(f"⏳ Yuborilmoqda... {i} / {len(ids)}")
+            except Exception:
+                pass
+    try:
+        await status_msg.edit_text(
+            f"✅ <b>Tarqatish tugadi</b>\n"
+            f"Yetkazildi: {ok}\n"
+            f"Botni bloklagan / o'chirgan: {blocked}\n"
+            f"Xatolik: {failed}")
+    except Exception:
+        pass
+
+@router.message(Command("close"))
+async def reg_close(m: Message):
+    if not is_admin(m):
+        return
+    global REG_OPEN
+    REG_OPEN = False; set_setting("reg_open", "0")
+    _dirty["since"] = _dirty["since"] or time.time()
+    await m.answer(f"🔒 Ro'yxatdan o'tish <b>yopildi</b>. /start bosganlar endi shu xabarni ko'radi:\n\n" + closed_text())
+
+@router.message(Command("open"))
+async def reg_open(m: Message):
+    if not is_admin(m):
+        return
+    global REG_OPEN
+    REG_OPEN = True; set_setting("reg_open", "1")
+    _dirty["since"] = _dirty["since"] or time.time()
+    await m.answer(f"🔓 <b>{OQIM}</b>ga ro'yxatdan o'tish <b>ochildi</b>.\n"
+                   f"Obunachilarga xabar berish uchun: /send")
+
+@router.message(Command("oqim"))
+async def set_oqim(m: Message):
+    """ /oqim IV oqim  — joriy oqim nomini o'zgartiradi """
+    if not is_admin(m):
+        return
+    global OQIM
+    arg = (m.text.split(maxsplit=1) + [""])[1].strip()
+    if not arg:
+        return await m.answer(f"Joriy oqim: <b>{OQIM}</b>\nO'zgartirish: <code>/oqim IV oqim</code>")
+    OQIM = arg; set_setting("oqim", arg)
+    _dirty["since"] = _dirty["since"] or time.time()
+    await m.answer(f"Joriy oqim endi: <b>{OQIM}</b>. Ro'yxat {'ochiq' if REG_OPEN else 'yopiq'}.")
+
+@router.message(Command("status"))
+async def status(m: Message):
+    if not is_admin(m):
+        return
+    with db() as con:
+        users = con.execute("SELECT COUNT(*) FROM users WHERE blocked=0").fetchone()[0]
+        blocked = con.execute("SELECT COUNT(*) FROM users WHERE blocked=1").fetchone()[0]
+        regs = con.execute("SELECT COUNT(*) FROM reg").fetchone()[0]
+        regs_now = con.execute("SELECT COUNT(*) FROM reg WHERE oqim=?", (OQIM,)).fetchone()[0]
+        last = con.execute("SELECT created_at, fio FROM reg ORDER BY id DESC LIMIT 1").fetchone()
+    up = datetime.now() - STARTED_AT
+    size = os.path.getsize(DB_PATH) // 1024 if os.path.exists(DB_PATH) else 0
+    await m.answer(
+        f"🟢 <b>Bot ishlayapti</b>\n"
+        f"Joriy oqim: <b>{OQIM}</b> — ro'yxat {'🔓 OCHIQ' if REG_OPEN else '🔒 YOPIQ'}\n"
+        f"Ishga tushgan: {STARTED_AT:%d.%m.%Y %H:%M} ({up.days} kun {up.seconds // 3600} soat oldin)\n\n"
+        f"<b>Baza:</b> oqim.db, {size} KB\n"
+        f"Obunachilar (xabar oladi): {users}\n"
+        f"Botni bloklaganlar: {blocked}\n"
+        f"Ro'yxatdan o'tganlar — jami: {regs}, {OQIM}: {regs_now}\n"
+        f"Oxirgi yozuv: {last['created_at'] + ' — ' + last['fio'] if last else '—'}\n"
+        f"Zaxira pin: {'bor' if _last_pin['msg_id'] else 'hali yuborilmagan'}")
 
 @router.message(Command("export"))
 async def export(m: Message):
