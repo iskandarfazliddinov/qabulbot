@@ -658,6 +658,21 @@ async def export(m: Message):
     if not sent:
         await m.answer("Hozircha yozuvlar yo'q.")
 
+@router.message(F.document)
+async def handle_db_upload(m: Message, bot: Bot):
+    if not is_admin(m):
+        return
+    if m.document and m.document.file_name == "oqim.db":
+        await bot.download(m.document, destination=DB_PATH)
+        init_db()
+        c = row_count()
+        await send_backup(bot, force=True)
+        await m.answer(
+            f"✅ <b>Baza muvaffaqiyatli tiklandi!</b>\n\n"
+            f"Jami yozuvlar: <b>{c} ta</b>.\n"
+            f"Yangi zaxira nusxa yaratildi va chatga qistirildi (pin qilindi)."
+        )
+
 def build_xlsx(district_key: str):
     name = DISTRICTS[district_key]["name"]
     with db() as con:
