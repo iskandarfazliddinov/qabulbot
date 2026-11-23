@@ -741,7 +741,11 @@ def build_xlsx(district_key: str):
 
 # ---------------------------------------------------------------- veb health-check (Koyeb / Render uchun)
 async def _health_check(request):
-    return web.Response(text="Bot is running!")
+    try:
+        c = row_count()
+    except Exception:
+        c = "err"
+    return web.Response(text=f"Bot is running! Rows: {c}")
 
 async def start_health_server():
     try:
