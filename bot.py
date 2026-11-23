@@ -10,6 +10,7 @@ import sqlite3
 import time
 from datetime import datetime
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandStart
@@ -487,6 +488,24 @@ def build_xlsx(district_key: str):
     wb.save(path)
     return path
 
+# ---------------------------------------------------------------- veb health-check (Koyeb / Render uchun)
+async def _health_check(request):
+    return web.Response(text="Bot is running!")
+
+async def start_health_server():
+    try:
+        port = int(os.environ.get("PORT", "8000"))
+        app = web.Application()
+        app.router.add_get("/", _health_check)
+        app.router.add_get("/health", _health_check)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        logging.info("Health server running on port %s", port)
+    except Exception as e:
+        logging.warning("Health server start failed: %s", e)
+
 # ---------------------------------------------------------------- ishga tushirish
 async def main():
     init_db()
@@ -495,6 +514,7 @@ async def main():
     dp.include_router(router)
     await restore_from_telegram(bot)
     asyncio.create_task(backup_loop(bot))
+    asyncio.create_task(start_health_server())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
