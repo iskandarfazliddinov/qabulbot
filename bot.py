@@ -673,6 +673,25 @@ async def handle_db_upload(m: Message, bot: Bot):
             f"Yangi zaxira nusxa yaratildi va chatga qistirildi (pin qilindi)."
         )
 
+@router.message(Command("restore"))
+async def cmd_restore(m: Message, bot: Bot):
+    if not is_admin(m):
+        return
+    await m.answer("♻️ Telegramdan zaxira bazani tiklash boshlandi...")
+    try:
+        chat = await bot.get_chat(BACKUP_CHAT)
+        pm = chat.pinned_message
+        if pm and pm.document and pm.document.file_name == "oqim.db":
+            await bot.download(pm.document, destination=DB_PATH)
+            _last_pin["msg_id"] = pm.message_id
+            init_db()
+            c = row_count()
+            await m.answer(f"✅ <b>Baza muvaffaqiyatli tiklandi!</b>\n\nJami yozuvlar: <b>{c} ta</b>.")
+        else:
+            await m.answer("❌ Pin qilingan oqim.db fayli topilmadi.")
+    except Exception as e:
+        await m.answer(f"❌ Xatolik yuz berdi: {e}")
+
 def build_xlsx(district_key: str):
     name = DISTRICTS[district_key]["name"]
     with db() as con:
